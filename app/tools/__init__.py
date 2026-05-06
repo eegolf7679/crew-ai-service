@@ -1,0 +1,33 @@
+"""Tool factory for the crew-ai-service.
+
+Each tool ID sent by the CIO KB v2 app maps to a CrewAI BaseTool. The
+factory is per-request because some tools (notably http_call) are
+scoped to the agent's whitelisted endpoints.
+"""
+from __future__ import annotations
+
+from typing import Any
+
+from .kb_search import build_kb_search
+from .web_search import build_web_search
+from .http_call import build_http_call
+
+
+def build_tools_for_agent(
+    tool_ids: list[str],
+    *,
+    company: str | None,
+    http_endpoints: list[dict[str, Any]] | None,
+) -> list[Any]:
+    out: list[Any] = []
+    for tid in tool_ids or []:
+        tid = (tid or "").strip().lower()
+        if tid == "kb_search":
+            out.append(build_kb_search(company=company))
+        elif tid == "web_search":
+            out.append(build_web_search())
+        elif tid == "http_call":
+            out.append(build_http_call(endpoints=http_endpoints or []))
+        # silently ignore unknown ids — the consumer app may roll out
+        # new tool IDs before the service knows them
+    return out
