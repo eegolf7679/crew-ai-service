@@ -1,0 +1,14 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.8.0
+pydantic-settings>=2.5.0
+httpx>=0.27.0
+orjson>=3.10.0
+
+# CrewAI
+crewai>=0.80.0
+crewai-tools>=0.14.0
+
+# LLM clients (CrewAI uses litellm under the hood; both work via OpenAI-compatible base URL)
+openai>=1.50.0
+litellm>=1.50.0
