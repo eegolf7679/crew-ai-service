@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import os
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
@@ -140,6 +141,72 @@ def run(req: RunRequest) -> RunResponse:
     # Per-run tool invocation trace (kb_search etc append to this).
     tool_trace: list[dict[str, Any]] = []
 
+    def _now() -> str:
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def _truncate(val: Any, limit: int = 4000) -> Any:
+        try:
+            if val is None:
+                return None
+            if isinstance(val, (dict, list)):
+                s = str(val)
+            else:
+                s = str(val)
+            if len(s) > limit:
+                return s[:limit] + "…[truncated]"
+            return val if isinstance(val, (dict, list)) else s
+        except Exception:
+            return None
+
+    MAX_TRACE_STEPS = 200
+
+    def _push_trace(entry: dict[str, Any]) -> None:
+        if len(tool_trace) >= MAX_TRACE_STEPS:
+            return
+        tool_trace.append(entry)
+
+    def on_step(step: Any) -> None:
+        try:
+            agent_obj = getattr(step, "agent", None)
+            agent_role = None
+            if agent_obj is not None:
+                agent_role = getattr(agent_obj, "role", None) or str(agent_obj)
+            tool = getattr(step, "tool", None)
+            tool_input = getattr(step, "tool_input", None)
+            log_text = getattr(step, "log", None)
+            result = (getattr(step, "result", None)
+                      or getattr(step, "return_values", None)
+                      or getattr(step, "output", None))
+            action = type(step).__name__.lower()
+            if tool:
+                action = "tool_call"
+            elif "finish" in action:
+                action = "final"
+            _push_trace({
+                "ts": _now(),
+                "agent": agent_role,
+                "action": action,
+                "tool": tool,
+                "input": _truncate(tool_input if tool_input is not None else log_text),
+                "output": _truncate(result),
+            })
+        except Exception as cb_err:
+            log.warning("on_step callback failed: %s", cb_err)
+
+    def on_task(task_output: Any) -> None:
+        try:
+            agent_role = (getattr(task_output, "agent", None)
+                          or getattr(getattr(task_output, "agent", None), "role", None))
+            raw = getattr(task_output, "raw", None) or str(task_output)
+            _push_trace({
+                "ts": _now(),
+                "agent": str(agent_role) if agent_role else None,
+                "action": "task_complete",
+                "output": _truncate(raw),
+            })
+        except Exception as cb_err:
+            log.warning("on_task callback failed: %s", cb_err)
+
     MASTER_DELEGATION_RULES = (
         "\n\nDelegation rules (MANDATORY):\n"
         "- You MUST delegate any factual, how-to, configuration, or "
@@ -258,6 +325,8 @@ def run(req: RunRequest) -> RunResponse:
                 tasks=tasks,
                 process=Process.sequential,
                 verbose=False,
+                step_callback=on_step,
+                task_callback=on_task,
             )
         else:
             # Sequential: chain one task per agent in the order received.
@@ -278,11 +347,29 @@ def run(req: RunRequest) -> RunResponse:
                 tasks=tasks,
                 process=Process.sequential,
                 verbose=False,
+                step_callback=on_step,
+                task_callback=on_task,
             )
 
         result = crew.kickoff(inputs={"question": question, "company": req.company or ""})
         # CrewAI returns a CrewOutput object in recent versions; coerce to str.
         output_text = getattr(result, "raw", None) or str(result)
+
+        # Append usage metrics as a final synthetic step if available.
+        try:
+            usage = getattr(result, "token_usage", None) or getattr(result, "usage_metrics", None)
+            if usage:
+                u = usage if isinstance(usage, dict) else getattr(usage, "__dict__", {}) or {}
+                _push_trace({
+                    "ts": _now(),
+                    "agent": "crew",
+                    "action": "usage",
+                    "tokens_in": u.get("prompt_tokens") or u.get("total_prompt_tokens"),
+                    "tokens_out": u.get("completion_tokens") or u.get("total_completion_tokens"),
+                    "output": _truncate(u),
+                })
+        except Exception:
+            pass
 
         return RunResponse(
             run_id=run_id,
