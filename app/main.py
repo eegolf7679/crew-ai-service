@@ -86,6 +86,7 @@ class RunResponse(BaseModel):
     output: Any | None = None
     error: str | None = None
     sources: list[dict[str, Any]] = Field(default_factory=list)
+    tool_trace: list[dict[str, Any]] = Field(default_factory=list)
 
 
 # ---------- routes ----------
@@ -136,6 +137,8 @@ def run(req: RunRequest) -> RunResponse:
 
     # Per-run collector that kb_search appends to. Returned as `sources`.
     sources_sink: list[dict[str, Any]] = []
+    # Per-run tool invocation trace (kb_search etc append to this).
+    tool_trace: list[dict[str, Any]] = []
 
     MASTER_DELEGATION_RULES = (
         "\n\nDelegation rules (MANDATORY):\n"
@@ -162,14 +165,16 @@ def run(req: RunRequest) -> RunResponse:
         backstory = spec.backstory or ""
         if spec.context:
             backstory = (backstory + "\n\nAdditional instructions:\n" + spec.context).strip()
-        # Hierarchical mode: CrewAI requires the manager to have no tools.
-        is_hier = (req.process or "").lower() == "hierarchical"
-        agent_tools = [] if (spec.is_master and is_hier) else spec.tools
+        # CrewAI requires the manager to have no tools when running
+        # hierarchically. We also strip tools from masters in our forced
+        # sequential KB-first pipeline so the master only synthesizes.
+        agent_tools = [] if spec.is_master else spec.tools
         tools = build_tools_for_agent(
             agent_tools,
             company=req.company,
             http_endpoints=spec.http_endpoints,
             sources_sink=sources_sink,
+            tool_trace=tool_trace,
         )
         role_lc = (spec.role or "").lower()
         if spec.is_master:
@@ -192,25 +197,66 @@ def run(req: RunRequest) -> RunResponse:
     try:
         masters = [a for a in req.agents if a.is_master]
         non_masters = [a for a in req.agents if not a.is_master]
-        wants_hier = (req.process or "").lower() == "hierarchical" or len(masters) == 1
+        kb_specialists = [a for a in non_masters
+                          if "kb_search" in [t.lower() for t in (a.tools or [])]]
 
-        if wants_hier and len(masters) == 1 and non_masters:
+        if len(masters) == 1 and kb_specialists:
+            # FORCED KB-FIRST SEQUENTIAL PIPELINE.
+            # Hierarchical delegation in CrewAI is fragile — managers
+            # frequently narrate "I will delegate" without actually firing
+            # the delegation tool. Instead: run KB Specialist(s) first so
+            # kb_search definitely executes, then have the master
+            # synthesize a final grounded answer from those results.
+            kb_agents = [build_agent(a) for a in kb_specialists]
+            other_workers = [build_agent(a) for a in non_masters
+                             if a not in kb_specialists]
             manager = build_agent(masters[0])
-            workers = [build_agent(a) for a in non_masters]
-            task = Task(
-                description=question,
+
+            tasks: list[Any] = []
+            for ag in kb_agents:
+                tasks.append(Task(
+                    description=(
+                        f"Research the user's question using kb_search. "
+                        f"You MUST call kb_search at least twice with "
+                        f"different phrasings before concluding. "
+                        f"Question: {question}"
+                    ),
+                    expected_output=(
+                        "Markdown research notes. Quote the relevant passages "
+                        "and cite each with [doc_id — \"title\"]. If nothing "
+                        "is found after multiple searches, say so explicitly."
+                    ),
+                    agent=ag,
+                ))
+            for ag in other_workers:
+                tasks.append(Task(
+                    description=(
+                        f"Using the prior research, contribute your "
+                        f"specialty's perspective on: {question}"
+                    ),
+                    expected_output="Markdown contribution with citations.",
+                    agent=ag,
+                    context=tasks[:],
+                ))
+            tasks.append(Task(
+                description=(
+                    f"Synthesize the prior research into a final, "
+                    f"well-structured Markdown answer to the user's "
+                    f"question. Use ONLY facts from the research above. "
+                    f"If the research found nothing, say so plainly and "
+                    f"do not invent an answer.\n\nQuestion: {question}"
+                ),
                 expected_output=(
-                    "A clear, well-structured Markdown answer. Include numbered "
-                    "citations like [1] when you use facts from kb_search, and a "
-                    "Sources list at the end."
+                    "Final Markdown answer with [doc_id — \"title\"] "
+                    "citations and a Sources list at the end."
                 ),
                 agent=manager,
-            )
+                context=tasks[:],
+            ))
             crew = Crew(
-                agents=workers,
-                tasks=[task],
-                process=Process.hierarchical,
-                manager_agent=manager,
+                agents=kb_agents + other_workers + [manager],
+                tasks=tasks,
+                process=Process.sequential,
                 verbose=False,
             )
         else:
@@ -244,10 +290,12 @@ def run(req: RunRequest) -> RunResponse:
             status="ok",
             output=output_text,
             sources=sources_sink,
+            tool_trace=tool_trace,
         )
     except Exception as e:
         log.exception("crew kickoff failed")
         return RunResponse(
             run_id=run_id, crew=crew_name, status="error",
             error=f"{type(e).__name__}: {e}",
+            tool_trace=tool_trace,
         )
