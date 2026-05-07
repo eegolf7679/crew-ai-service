@@ -136,17 +136,36 @@ class KbSearchTool(BaseTool):
     default_customer: str | None = Field(default=None)
     require_customer: bool = Field(default=True)
     _sources_sink: list[dict[str, Any]] | None = PrivateAttr(default=None)
+    _tool_trace: list[dict[str, Any]] | None = PrivateAttr(default=None)
 
     def attach_sink(self, sink: list[dict[str, Any]]) -> None:
         self._sources_sink = sink
 
+    def attach_trace(self, trace: list[dict[str, Any]]) -> None:
+        self._tool_trace = trace
+
     def _run(self, query: str, top_k: int = 10, **_: Any) -> str:
         cust = self.default_customer
         if self.require_customer and not (cust and cust.strip()):
+            if self._tool_trace is not None:
+                self._tool_trace.append({
+                    "tool": "kb_search", "query": query, "customer": None,
+                    "status": "refused_no_customer", "result_count": 0,
+                })
             return ("[kb_search refused — no customer scope on this run. "
                     "Tell the user you cannot search without a selected customer.]")
 
         result = _vectara_query(query, cust, top_k)
+
+        if self._tool_trace is not None:
+            self._tool_trace.append({
+                "tool": "kb_search",
+                "query": query,
+                "customer": cust,
+                "status": "error" if result.get("error") else "ok",
+                "error": result.get("error"),
+                "result_count": len(result.get("results") or []),
+            })
 
         # dedupe-append into the per-run sources sink
         if self._sources_sink is not None and result.get("results"):
@@ -167,8 +186,11 @@ class KbSearchTool(BaseTool):
 
 
 def build_kb_search(company: str | None,
-                    sources_sink: list[dict[str, Any]] | None = None) -> KbSearchTool:
+                    sources_sink: list[dict[str, Any]] | None = None,
+                    tool_trace: list[dict[str, Any]] | None = None) -> KbSearchTool:
     tool = KbSearchTool(default_customer=company)
     if sources_sink is not None:
         tool.attach_sink(sources_sink)
+    if tool_trace is not None:
+        tool.attach_trace(tool_trace)
     return tool
