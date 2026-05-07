@@ -85,6 +85,7 @@ class RunResponse(BaseModel):
     status: str
     output: Any | None = None
     error: str | None = None
+    sources: list[dict[str, Any]] = Field(default_factory=list)
 
 
 # ---------- routes ----------
@@ -133,13 +134,48 @@ def run(req: RunRequest) -> RunResponse:
 
     default_model = req.model or settings.DEFAULT_MODEL
 
+    # Per-run collector that kb_search appends to. Returned as `sources`.
+    sources_sink: list[dict[str, Any]] = []
+
+    MASTER_DELEGATION_RULES = (
+        "\n\nDelegation rules (MANDATORY):\n"
+        "- You MUST delegate any factual, how-to, configuration, or "
+        "troubleshooting question to the Knowledge Base Specialist.\n"
+        "- Never answer from your own training data.\n"
+        "- If no specialist can handle the request, say so plainly and "
+        "stop — do not invent an answer."
+    )
+    KB_SPECIALIST_RULES = (
+        "\n\nKnowledge Base rules (MANDATORY):\n"
+        "- You MUST call kb_search at least TWICE with DIFFERENT phrasings "
+        "of the question before answering (e.g. 'install new user', "
+        "'create user account', 'user provisioning steps').\n"
+        "- Only after exhausting reasonable rephrasings may you say "
+        "'no documentation found'.\n"
+        "- When you answer, you MUST: (1) quote or paraphrase the snippet "
+        "you used; (2) cite the doc_id and title for every claim, like "
+        "[abc-123 — \"How to add a new user\"]; (3) ignore any result "
+        "that looks off-topic for the current customer."
+    )
+
     def build_agent(spec: AgentSpec) -> Any:
         backstory = spec.backstory or ""
         if spec.context:
             backstory = (backstory + "\n\nAdditional instructions:\n" + spec.context).strip()
+        # Hierarchical mode: CrewAI requires the manager to have no tools.
+        is_hier = (req.process or "").lower() == "hierarchical"
+        agent_tools = [] if (spec.is_master and is_hier) else spec.tools
         tools = build_tools_for_agent(
-            spec.tools, company=req.company, http_endpoints=spec.http_endpoints,
+            agent_tools,
+            company=req.company,
+            http_endpoints=spec.http_endpoints,
+            sources_sink=sources_sink,
         )
+        role_lc = (spec.role or "").lower()
+        if spec.is_master:
+            backstory = (backstory + MASTER_DELEGATION_RULES).strip()
+        if "knowledge base" in role_lc or "kb_search" in (spec.tools or []):
+            backstory = (backstory + KB_SPECIALIST_RULES).strip()
         kwargs: dict[str, Any] = {
             "role": spec.role or spec.name or "Specialist",
             "goal": spec.goal or "Answer the user's question accurately.",
@@ -207,6 +243,7 @@ def run(req: RunRequest) -> RunResponse:
             crew=crew_name,
             status="ok",
             output=output_text,
+            sources=sources_sink,
         )
     except Exception as e:
         log.exception("crew kickoff failed")
