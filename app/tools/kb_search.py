@@ -23,9 +23,12 @@ def _esc(s: str) -> str:
 def build_filter(company: str | None, extra: str | None = None) -> str:
     parts: list[str] = []
     if company and company.strip():
-        # Part-level metadata field (matches working _shared/vectara.ts).
-        # Vectara rejects 'doc.customer' on this corpus.
-        parts.append(f"customer = '{_esc(company.strip())}'")
+        # Document-level metadata fields on this corpus.
+        # Match the company OR shared/global docs.
+        c = _esc(company.strip())
+        parts.append(
+            f"(doc.source_company = '{c}' OR doc.company_slug = '_shared')"
+        )
     if extra and extra.strip():
         parts.append(f"({extra.strip()})")
     return " AND ".join(parts)
